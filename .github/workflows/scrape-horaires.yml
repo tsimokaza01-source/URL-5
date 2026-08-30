@@ -1,0 +1,83 @@
+name: Scrape Horaires Médecins
+
+on:
+  workflow_dispatch:        # lancement manuel
+  # Filet de sécurité : si le job s'est arrêté brutalement (crash runner, etc.)
+  # sans avoir pu se redéclencher lui-même, ce cron reprend le travail.
+  schedule:
+    - cron: '0 * * * *'     # toutes les heures
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: scrape-horaires
+  cancel-in-progress: false   # ne jamais couper un run en cours, juste mettre en file
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355      # garde-fou : la limite dure de GitHub est 360mn
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer le scraping (350mn max)
+        id: scrape
+        timeout-minutes: 350
+        continue-on-error: true   # si ça coupe/timeout, on continue quand même vers la suite
+        run: python horaires_scraper.py --input medecins.csv --output medecins_horaires_enrichi.csv --max-concurrent 2
+
+      - name: Sauvegarder la progression finale
+        if: always()
+        run: |
+          git add medecins_horaires_enrichi.csv || true
+          if ! git diff --cached --quiet; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "Sauvegarde progression (fin de job)"
+            git pull --rebase --autostash
+            git push
+          fi
+
+      - name: Vérifier s'il reste des lignes à traiter
+        id: check
+        if: always()
+        run: |
+          python - <<'EOF'
+          import pandas as pd, os, sys
+
+          f = "medecins_horaires_enrichi.csv"
+          gh_output = os.environ["GITHUB_OUTPUT"]
+
+          if not os.path.exists(f):
+              with open(gh_output, "a") as fh:
+                  fh.write("remaining=true\n")
+              sys.exit(0)
+
+          df = pd.read_csv(f, sep=";", encoding="utf-8-sig")
+          remaining = (df["Statut Horaires"] == "").sum() if "Statut Horaires" in df.columns else 0
+          print(f"Lignes restantes : {remaining}")
+
+          with open(gh_output, "a") as fh:
+              fh.write(f"remaining={'true' if remaining > 0 else 'false'}\n")
+          EOF
+
+      - name: Relancer automatiquement le workflow (travail non terminé)
+        if: always() && steps.check.outputs.remaining == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "scrape-horaires.yml" --ref "${{ github.ref_name }}"
