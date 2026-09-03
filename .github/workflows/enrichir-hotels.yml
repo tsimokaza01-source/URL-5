@@ -1,0 +1,73 @@
+name: Enrichissement hotels
+
+on:
+  workflow_dispatch:      # lancement manuel depuis l'onglet "Actions"
+
+jobs:
+  enrichir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350        # lot de 1000 hotels : prevoir large (plafond Actions = 360 min)
+    permissions:
+      contents: write          # nécessaire pour re-commit liste_hotels.csv / hotels_enrichis.csv
+      actions: write           # nécessaire pour déclencher le prochain lot (workflow_dispatch)
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances
+        run: pip install requests
+
+      - name: Configurer l'identité Git (pour les commits en temps réel)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Lancer l'enrichissement (lot de 1000 hôtels max, traités et enregistrés un par un)
+        id: enrichissement
+        env:
+          MAX_HOTELS_PAR_RUN: "1000"
+          COMMIT_TEMPS_REEL: "1"    # le script commit + push après chaque hôtel traité
+          COMMIT_TOUTES_LES: "1"    # 1 = temps réel ; augmenter pour committer moins souvent
+        run: |
+          # Le script sort avec le code 2 s'il reste des hôtels à traiter, 0 si
+          # tout est terminé. On capture ce code sans faire échouer le job.
+          set +e
+          python enrichir_hotels.py
+          echo "code_sortie=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Uploader le CSV des résultats comme artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotels_enrichis-${{ github.run_number }}
+          path: hotels_enrichis.csv
+
+      - name: Committer et pousser un reliquat éventuel (filet de sécurité)
+        if: always()
+        run: |
+          git add liste_hotels.csv hotels_enrichis.csv
+          git diff --staged --quiet || git commit -m "Enrichissement hotels - fin de run (run #${{ github.run_number }})"
+          git push || true
+
+      - name: Attendre un peu avant le lot suivant (limiter le débit)
+        if: steps.enrichissement.outputs.code_sortie == '2'
+        run: sleep 30
+
+      - name: Déclencher le lot suivant s'il reste des hôtels à traiter
+        if: steps.enrichissement.outputs.code_sortie == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Il reste des hôtels à traiter - déclenchement du prochain lot..."
+          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}"
+
+      - name: Tout est terminé
+        if: steps.enrichissement.outputs.code_sortie == '0'
+        run: echo "✅ Tous les hôtels ont été traités, aucun lot supplémentaire nécessaire."
