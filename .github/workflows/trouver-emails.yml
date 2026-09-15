@@ -1,0 +1,68 @@
+name: Recherche d'emails par crawling + validation SMTP
+
+on:
+  workflow_dispatch:      # lancement manuel depuis l'onglet "Actions"
+
+jobs:
+  trouver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90        # crawling (plusieurs pages/site) + validation SMTP : plus lent qu'une simple vérification d'email
+    permissions:
+      contents: write          # nécessaire pour re-commit liste_sites.csv / emails_trouves.csv
+      actions: write           # nécessaire pour déclencher le prochain lot (workflow_dispatch)
+
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances
+        run: pip install requests dnspython
+
+      - name: Lancer la recherche d'emails (lot de 50 sites max)
+        id: recherche
+        env:
+          MAX_SITES_PAR_RUN: "50"
+        run: |
+          # Le script sort avec le code 2 s'il reste des sites à traiter, 0 si
+          # tout est terminé. On capture ce code sans faire échouer le job.
+          set +e
+          python trouver_emails_sites.py
+          echo "code_sortie=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Uploader le CSV des résultats comme artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emails_trouves-${{ github.run_number }}
+          path: emails_trouves.csv
+
+      - name: Committer et pousser les fichiers mis à jour
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add liste_sites.csv emails_trouves.csv
+          git diff --staged --quiet || git commit -m "Recherche d'emails - lot de 50 (run #${{ github.run_number }})"
+          git push
+
+      - name: Attendre un peu avant le lot suivant (limiter le débit)
+        if: steps.recherche.outputs.code_sortie == '2'
+        run: sleep 30
+
+      - name: Déclencher le lot suivant s'il reste des sites à traiter
+        if: steps.recherche.outputs.code_sortie == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Il reste des sites à traiter - déclenchement du prochain lot..."
+          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}"
+
+      - name: Tout est terminé
+        if: steps.recherche.outputs.code_sortie == '0'
+        run: echo "✅ Tous les sites ont été traités, aucun lot supplémentaire nécessaire."
